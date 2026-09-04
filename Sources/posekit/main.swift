@@ -1,13 +1,13 @@
 // posekit — camera poses from Apple's photogrammetry, for splat trainers.
 //
 //     posekit <image-folder> [--out <dir>] [--sequential] [--object]
-//             [--preview-model] [--high-sensitivity]
+//             [--model <detail>] [--usdz] [--masks <dir>] [--high-sensitivity]
 //
 // Runs RealityKit's PhotogrammetrySession over a folder of images and
 // exports what Gaussian-splat trainers eat: a nerfstudio transforms.json
 // (camera-to-world, OpenGL camera axes — Apple's pose convention verbatim),
 // a COLMAP text model (world-to-camera, OpenCV axes), and the sparse point
-// cloud as PLY. No mesh is requested unless --preview-model is passed, so
+// cloud as PLY. No mesh is requested unless --model is passed, so
 // the run stops after image alignment — the cheap part.
 //
 // Conventions, verified against the macOS 26 SDK and validated empirically
@@ -22,6 +22,7 @@
 
 import Foundation
 import ImageIO
+import CoreVideo
 import RealityKit
 import simd
 
@@ -32,55 +33,136 @@ struct Options {
     var out: URL
     var sequential = false
     var objectMode = false
-    var previewModel = false
+    var modelDetail: PhotogrammetrySession.Request.Detail?
+    var usdz = false
+    var masks: URL?
     var highSensitivity = false
 }
 
+func fail(_ message: String, code: Int32 = 1) -> Never {
+    FileHandle.standardError.write(Data("posekit: \(message)\n".utf8))
+    exit(code)
+}
+
 func parseOptions() -> Options {
-    var args = Array(CommandLine.arguments.dropFirst())
-    func flag(_ name: String) -> Bool {
-        if let i = args.firstIndex(of: name) {
-            args.remove(at: i)
-            return true
+    let args = Array(CommandLine.arguments.dropFirst())
+    var inputArg: String?
+    var outArg: String?
+    var options = Options(input: URL(fileURLWithPath: "."), out: URL(fileURLWithPath: "."))
+    var i = 0
+    func value() -> String {
+        guard i + 1 < args.count, !args[i + 1].hasPrefix("--") else {
+            fail("\(args[i]) requires a value", code: 2)
         }
-        return false
+        i += 1
+        return args[i]
     }
-    func value(_ name: String) -> String? {
-        guard let i = args.firstIndex(of: name), i + 1 < args.count else { return nil }
-        let v = args[i + 1]
-        args.removeSubrange(i...(i + 1))
-        return v
+    let details: [String: PhotogrammetrySession.Request.Detail] = [
+        "preview": .preview, "reduced": .reduced, "medium": .medium, "full": .full, "raw": .raw,
+    ]
+    while i < args.count {
+        switch args[i] {
+        case "--out": outArg = value()
+        case "--masks": options.masks = URL(fileURLWithPath: value(), isDirectory: true)
+        case "--sequential": options.sequential = true
+        case "--object": options.objectMode = true
+        case "--high-sensitivity": options.highSensitivity = true
+        case "--usdz": options.usdz = true
+        case "--model", "--preview-model":
+            let name = args[i] == "--preview-model" ? "preview" : value()
+            guard let detail = details[name] else {
+                fail("invalid model detail '\(name)' (preview, reduced, medium, full, raw)", code: 2)
+            }
+            if let previous = options.modelDetail, previous != detail {
+                fail("conflicting model detail options", code: 2)
+            }
+            options.modelDetail = detail
+        case "--help", "-h":
+            print("""
+            usage: posekit <image-folder> [--out <dir>] [--sequential] [--object]
+                           [--model <preview|reduced|medium|full|raw>] [--usdz]
+                           [--masks <dir>] [--high-sensitivity]
+              --preview-model     alias for --model preview (OBJ output)
+              --usdz              also write model.usdz; requires --model
+              --masks <dir>       <stem>.png, white subject, raw photo pixel grid
+              --object            enable automatic object masking
+              --sequential        time-ordered images (speed hint)
+              --high-sensitivity  work harder on low-texture scenes
+            """)
+            exit(0)
+        default:
+            guard !args[i].hasPrefix("-"), inputArg == nil else {
+                fail("unexpected argument '\(args[i])'; use --help", code: 2)
+            }
+            inputArg = args[i]
+        }
+        i += 1
     }
-    let sequential = flag("--sequential")
-    let objectMode = flag("--object")
-    let previewModel = flag("--preview-model")
-    let highSensitivity = flag("--high-sensitivity")
-    let outArg = value("--out")
-
-    guard args.count == 1 else {
-        FileHandle.standardError.write(Data("""
-        posekit — camera poses from Apple's photogrammetry, for splat trainers
-
-        usage: posekit <image-folder> [--out <dir>] [--sequential] [--object]
-                       [--preview-model] [--high-sensitivity]
-
-          --sequential        images are a time-ordered walk (speed hint only)
-          --object            single-object capture: keep Apple's auto-masking
-                              (default is scene mode: masking off, and the
-                              bounding box ignored where the OS allows)
-          --preview-model     also produce a preview-detail USDZ
-          --high-sensitivity  work harder on low-texture scenes
-
-        """.utf8))
-        exit(2)
+    guard let inputArg else { fail("image folder required; use --help", code: 2) }
+    guard !options.usdz || options.modelDetail != nil else {
+        fail("--usdz requires --model (or --preview-model)", code: 2)
     }
-    let input = URL(fileURLWithPath: args[0], isDirectory: true)
-    let out = outArg.map { URL(fileURLWithPath: $0, isDirectory: true) }
-        ?? input.deletingLastPathComponent()
-            .appendingPathComponent(input.lastPathComponent + "-poses")
-    return Options(
-        input: input, out: out, sequential: sequential, objectMode: objectMode,
-        previewModel: previewModel, highSensitivity: highSensitivity)
+    options.input = URL(fileURLWithPath: inputArg, isDirectory: true)
+    options.out = outArg.map { URL(fileURLWithPath: $0, isDirectory: true) }
+        ?? options.input.deletingLastPathComponent()
+            .appendingPathComponent(options.input.lastPathComponent + "-poses")
+    return options
+}
+
+// Decode the stored pixel grid without applying EXIF orientation, scaling, or cropping.
+func pixelBuffer(at url: URL, grayscale: Bool) throws -> CVPixelBuffer {
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+        throw NSError(domain: "posekit", code: 1,
+                      userInfo: [NSLocalizedDescriptionKey: "Cannot decode \(url.lastPathComponent)"])
+    }
+    var buffer: CVPixelBuffer?
+    let format = grayscale ? kCVPixelFormatType_OneComponent8 : kCVPixelFormatType_32ARGB
+    let status = CVPixelBufferCreate(kCFAllocatorDefault, image.width, image.height, format,
+                                    nil, &buffer)
+    guard status == kCVReturnSuccess, let buffer else {
+        throw NSError(domain: "posekit", code: Int(status))
+    }
+    CVPixelBufferLockBaseAddress(buffer, [])
+    defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+    let space = grayscale ? CGColorSpaceCreateDeviceGray() : CGColorSpaceCreateDeviceRGB()
+    let alpha = grayscale ? CGImageAlphaInfo.none : CGImageAlphaInfo.noneSkipFirst
+    guard let context = CGContext(data: CVPixelBufferGetBaseAddress(buffer),
+                                  width: image.width, height: image.height, bitsPerComponent: 8,
+                                  bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
+                                  space: space, bitmapInfo: alpha.rawValue) else {
+        throw NSError(domain: "posekit", code: 1,
+                      userInfo: [NSLocalizedDescriptionKey: "Cannot create image context"])
+    }
+    context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+    return buffer
+}
+
+func maskedSample(id: Int, photo: URL, mask: URL) throws -> PhotogrammetrySample {
+    var sample: PhotogrammetrySample
+    if #available(macOS 15.0, *) {
+        // Preserve the framework's depth, gravity, and EXIF decoding, but assign a
+        // stable ID so sequence input can still be joined to the source photo.
+        let loaded = try PhotogrammetrySample(contentsOf: photo)
+        sample = PhotogrammetrySample(id: id, image: loaded.image)
+        sample.metadata = loaded.metadata
+        sample.depthDataMap = loaded.depthDataMap
+        sample.gravity = loaded.gravity
+    } else {
+        sample = PhotogrammetrySample(id: id, image: try pixelBuffer(at: photo, grayscale: false))
+        if let source = CGImageSourceCreateWithURL(photo as CFURL, nil),
+           let metadata = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] {
+            sample.metadata = metadata
+        }
+    }
+    let buffer = try pixelBuffer(at: mask, grayscale: true)
+    guard CVPixelBufferGetWidth(buffer) == CVPixelBufferGetWidth(sample.image),
+          CVPixelBufferGetHeight(buffer) == CVPixelBufferGetHeight(sample.image) else {
+        throw NSError(domain: "posekit", code: 1,
+                      userInfo: [NSLocalizedDescriptionKey: "Mask dimensions differ for \(photo.lastPathComponent)"])
+    }
+    sample.objectMask = buffer
+    return sample
 }
 
 // MARK: - Image metadata (dimensions always; EXIF focal fallback pre-26)
@@ -151,8 +233,8 @@ guard PhotogrammetrySession.isSupported else {
 var configuration = PhotogrammetrySession.Configuration()
 configuration.sampleOrdering = options.sequential ? .sequential : .unordered
 configuration.featureSensitivity = options.highSensitivity ? .high : .normal
-configuration.isObjectMaskingEnabled = options.objectMode
-if #available(macOS 15.0, *), !options.objectMode {
+configuration.isObjectMaskingEnabled = options.objectMode || options.masks != nil
+if #available(macOS 15.0, *), !options.objectMode, options.masks == nil {
     // Scene mode: recover everything the images saw, not one masked object.
     configuration.ignoreBoundingBox = true
 }
@@ -161,13 +243,50 @@ let limits = PhotogrammetrySession.limits
 print("posekit: limits on this machine — \(limits.maximumNumberOfInputImages) images, "
     + "\(limits.maximumInputImageDimension) px")
 
-let session = try PhotogrammetrySession(input: options.input, configuration: configuration)
+var sampleURLs: [Int: URL] = [:]
+var missingMasks = 0
+let session: PhotogrammetrySession
+if let masks = options.masks {
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: masks.path, isDirectory: &isDirectory),
+          isDirectory.boolValue else { fail("mask directory does not exist") }
+    let photos = try FileManager.default.contentsOfDirectory(
+        at: options.input, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])
+        .filter { (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+            && imageInfo(at: $0) != nil }
+        .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    var entries: [(id: Int, photo: URL, mask: URL)] = []
+    for (index, photo) in photos.enumerated() {
+        let mask = masks.appendingPathComponent(photo.deletingPathExtension().lastPathComponent + ".png")
+        guard FileManager.default.fileExists(atPath: mask.path) else {
+            missingMasks += 1
+            continue
+        }
+        let id = index + 1
+        sampleURLs[id] = photo
+        entries.append((id, photo, mask))
+    }
+    print("posekit: masks — \(entries.count) photos included, \(missingMasks) skipped for missing masks")
+    guard !entries.isEmpty else { fail("no photos with matching masks") }
+    // Decode lazily: a full capture must not retain every uncompressed photo in RAM.
+    let samples = entries.lazy.map { entry -> PhotogrammetrySample in
+        do { return try maskedSample(id: entry.id, photo: entry.photo, mask: entry.mask) }
+        catch { fail("cannot load masked photo \(entry.photo.lastPathComponent): \(error.localizedDescription)") }
+    }
+    session = try PhotogrammetrySession(input: samples, configuration: configuration)
+} else {
+    session = try PhotogrammetrySession(input: options.input, configuration: configuration)
+}
 
 var requests: [PhotogrammetrySession.Request] = [.poses, .pointCloud]
-let modelURL = options.out.appendingPathComponent("preview.usdz")
-if options.previewModel {
-    requests.append(.modelFile(url: modelURL, detail: .preview))
+if let detail = options.modelDetail {
+    requests.append(.modelFile(url: options.out.appendingPathComponent("model.obj"), detail: detail))
+    if options.usdz {
+        requests.append(.modelFile(url: options.out.appendingPathComponent("model.usdz"), detail: detail))
+    }
 }
+var pendingRequests = Set(requests)
+var requestFailed = false
 
 try FileManager.default.createDirectory(at: options.out, withIntermediateDirectories: true)
 
@@ -178,9 +297,10 @@ var downsampled = false
 let started = Date()
 
 try session.process(requests: requests)
-for try await output in session.outputs {
+outputLoop: for try await output in session.outputs {
     switch output {
     case .requestComplete(let request, let result):
+        pendingRequests.remove(request)
         switch result {
         case .poses(let p):
             poses = p
@@ -190,17 +310,19 @@ for try await output in session.outputs {
             cloud = c
             print("posekit: sparse cloud — \(c.points.count) points")
         case .modelFile(let url):
-            print("posekit: preview model — \(url.lastPathComponent)")
+            print("posekit: model — \(url.path)")
+            // The modelFile result contains only a URL, not a triangle count.
+            print("posekit: triangle count not reported by framework; GLB conversion reports it")
         default:
             break
         }
         // Everything wanted has arrived; a mesh nobody asked for should not
         // keep the GPU warm.
-        if poses != nil, cloud != nil, !options.previewModel {
+        if poses != nil, cloud != nil, options.modelDetail == nil {
             session.cancel()
         }
-        _ = request
     case .requestError(let request, let error):
+        requestFailed = true
         FileHandle.standardError.write(
             Data("posekit: request \(request) failed — \(error)\n".utf8))
     case .invalidSample(let id, let reason):
@@ -210,10 +332,14 @@ for try await output in session.outputs {
     case .automaticDownsampling:
         downsampled = true
     case .processingComplete, .processingCancelled:
-        break
+        break outputLoop
     default:
         break
     }
+}
+
+guard !requestFailed, pendingRequests.isEmpty else {
+    fail("one or more requested outputs were not produced")
 }
 
 guard let poses else {
@@ -234,7 +360,7 @@ struct Frame {
 var frames: [Frame] = []
 var missingIntrinsics = 0
 for (id, pose) in poses.posesBySample.sorted(by: { $0.key < $1.key }) {
-    guard let url = poses.urlsBySample[id] else { continue }
+    guard let url = sampleURLs[id] ?? poses.urlsBySample[id] else { continue }
     guard let info = imageInfo(at: url) else { continue }
     guard let k = intrinsics(for: pose, info: info) else {
         missingIntrinsics += 1
