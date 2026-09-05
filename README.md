@@ -126,23 +126,73 @@ python3 -m venv .venv
 
 The pinned `trimesh` and `pillow` dependencies load OBJ/MTL, triangulate faces,
 and embed the diffuse texture in a single binary glTF file. Conversion prints
-vertex count, triangle count, and GLB size in bytes. It refuses missing MTLs,
+source and embedded texture dimensions and byte sizes, vertex count, triangle
+count, and final GLB size in bytes. It refuses missing MTLs,
 missing/unreadable diffuse textures, and meshes without UVs rather than silently
-writing an untextured deliverable. MTL `map_Kd` options are unsupported and must
+writing an untextured deliverable. MTL texture-map options are unsupported and must
 be baked first; keep the OBJ, MTL, and texture together for loading. This step
 packages the mesh; it does not simplify geometry. Upload the `.glb` alone.
+
+### Textures and web delivery
+
+The masked oak run from 169 photographs produced 55,836 vertices and 99,999
+triangles: a 10.8 MB OBJ, but a **66.3 MB GLB** when the full colour texture was
+embedded. Its companion maps were 72.2 MB colour PNG, 47.7 MB normal PNG,
+35.2 MB roughness PNG, 9.5 MB ambient-occlusion PNG, and 137.5 MB displacement
+EXR. The textures, rather than the geometry, dominate the gallery's 20 MB budget.
+An 8192-square colour map is excessive for this roughly 100,000-triangle web mesh.
+
+The converter now defaults to colour only, a longest side of **2048 pixels**,
+and **WebP quality 90**. Resizing preserves aspect ratio with Pillow LANCZOS;
+`--max-texture 0` disables resizing but still re-encodes the texture. It prints
+source dimensions/bytes, resized dimensions, each embedded image's dimensions/bytes,
+and final GLB bytes. A one-line warning appears above 20,000,000 bytes without
+refusing to write the file. The actual oak assets are not included here, so run
+the conversion to measure its reduced size; no reduced oak size is implied.
+
+```sh
+# Smaller web delivery:
+.venv/bin/python tools/obj_to_glb.py ./out/tree-mesh/model.obj ./out/tree-mesh/web.glb \
+  --max-texture 1024 --texture-quality 85
+# Core glTF compatibility and optional maps for Blender:
+.venv/bin/python tools/obj_to_glb.py ./out/tree-mesh/model.obj ./out/tree-mesh/detail.glb \
+  --texture-format png --extra-maps
+```
+
+`--texture-format png|jpeg|webp` selects the encoding. PNG and JPEG are core glTF
+formats. WebP declares **EXT_texture_webp** in both `extensionsUsed` and
+`extensionsRequired`; **a viewer without that extension will not load it**.
+Use JPEG for compact core-compatible output, or PNG for lossless pixels.
+`--texture-quality` accepts 0-100 (default 90) for JPEG/WebP and is ignored for
+PNG. JPEG discards alpha with a warning; PNG and WebP retain it. If WebP cannot
+be encoded or its extension declaration is invalid, the tool reports a JPEG
+fallback rather than writing an incorrectly declared WebP asset.
+
+`--extra-maps` adds referenced normal, roughness, and occlusion maps, each with
+the same size limit and encoding. Supported MTL keys are `norm`, `map_Kn`,
+`map_Bump`/`bump` (assumed tangent-space normal images), `map_Pr`/`map_roughness`,
+and `map_AO`/`map_occ`/`map_occlusion`. Scalar roughness is packed into glTF's green
+channel with nonmetallic blue; occlusion uses red. PNG is preferable for exact
+normal and material values. Height-to-normal conversion is not performed.
+Displacement directives are ignored and EXR maps are never embedded: glTF has
+no displacement slot. Optional maps are neither required nor embedded by default.
+
+The trunk of a tree meshes well while its canopy does not: a mesh is the right
+deliverable for stone, timber and metal, and a splat is right for foliage.
 
 CPU-only verification (no reconstruction session):
 
 ```sh
 .venv/bin/python -m unittest discover -s tools -p 'test_*.py' -v
 .venv/bin/python -m pip install ruff==0.15.5
-.venv/bin/ruff check tools --line-length 120
+.venv/bin/ruff check tools --line-length 120 --select E,F,B,RUF
 ```
 
 The synthetic textured-quad test removes the source assets before reloading the
 GLB and checks geometry, UVs, and embedded texture pixels. Additional cases check
-missing assets/UVs and the framework's directory-shaped OBJ output.
+missing assets/UVs, the framework's directory-shaped OBJ output, resizing and
+encoding, WebP extension references, optional map slots and roughness channels,
+displacement exclusion, and the 20 MB warning with an actual oversized GLB.
 
 ## Conventions, and how much to trust them
 
