@@ -250,10 +250,16 @@ if let masks = options.masks {
     var isDirectory: ObjCBool = false
     guard FileManager.default.fileExists(atPath: masks.path, isDirectory: &isDirectory),
           isDirectory.boolValue else { fail("mask directory does not exist") }
+    // Resolve symlinks before asking whether this is a regular file: a capture
+    // directory is often a set of links into the original card dump, and an
+    // unresolved link answers false, which silently empties the whole list.
     let photos = try FileManager.default.contentsOfDirectory(
         at: options.input, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])
-        .filter { (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
-            && imageInfo(at: $0) != nil }
+        .filter { url in
+            let resolved = url.resolvingSymlinksInPath()
+            let isFile = (try? resolved.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+            return isFile && imageInfo(at: url) != nil
+        }
         .sorted { $0.lastPathComponent < $1.lastPathComponent }
     var entries: [(id: Int, photo: URL, mask: URL)] = []
     for (index, photo) in photos.enumerated() {
